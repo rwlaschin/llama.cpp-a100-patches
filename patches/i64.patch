@@ -1,0 +1,92 @@
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -208,6 +208,7 @@
+ option(GGML_CUDA_MMQ_STAGE_LINEAR           "ggml: mmq: linear thread-to-chunk staging copy"                 OFF)
+ option(GGML_CUDA_MMQ_Y_ASYNC                "ggml: mmq: async y tile loads over the staged weights"          OFF)
+ option(GGML_CUDA_MMQ_Q8_CACHE               "ggml: mmq: quantize each activation to q8_1 once per graph"     OFF)
++option(GGML_CUDA_MMQ_I64                    "ggml: mmq: 64-row decode tiles, two blocks per SM (GA100)"     OFF)
+ set   (GGML_CUDA_MMQ_CUBLAS_ABOVE "0" CACHE STRING "ggml: mmq: use cuBLAS for batches of at least this many columns, 0 to keep mmq")
+ set   (GGML_CUDA_MMQ_STAGE_STRIDE "" CACHE STRING "ggml: mmq: bytes between staged weight rows, empty for the default")
+ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -144,7 +144,7 @@
+         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+     endif()
+ 
+-    foreach (opt I2F_EXACT Y_ONCE STAGE STAGE_RING STAGE_LINEAR Y_ASYNC Q8_CACHE)
++    foreach (opt I2F_EXACT Y_ONCE STAGE STAGE_RING STAGE_LINEAR Y_ASYNC Q8_CACHE I64)
+         if (GGML_CUDA_MMQ_${opt})
+             add_compile_definitions(GGML_CUDA_MMQ_${opt})
+         endif()
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -254,6 +254,20 @@
+ 
+ #undef CASE
+ 
++#ifdef GGML_CUDA_MMQ_I64
++// GGML_CUDA_MMQ_I64: on the GA100, decode tiles (J <= 32) take 64 rows and 4 warps instead of 128 rows and 8 warps.
++// A 128-row block needs ~96 KB of shared memory, so one fits per SM and nothing overlaps its load/sync phases;
++// a 64-row block needs ~56 KB, so two co-reside (same 8 warps per SM) and the stream-k split has twice the tiles.
++static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_i64(ggml_cuda_mmq_config c) {
++    if (c.J <= 32 && c.nthreads == 256 && c.occupancy == 1 && c.I == 128) {
++        c.nthreads  = 128;
++        c.occupancy = 2;
++        c.I         = 64;
++    }
++    return c;
++}
++#endif // GGML_CUDA_MMQ_I64
++
+ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
+     if (GGML_CUDA_CC_IS_AMD(cc)) {
+         if (GGML_CUDA_CC_IS_GCN(cc)) {
+@@ -284,6 +298,12 @@
+         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
+     }
+     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
++#ifdef GGML_CUDA_MMQ_I64
++        // The arch of the code the device actually runs, so this agrees with the kernel's __CUDA_ARCH__ test.
++        if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_AMPERE) {
++            return ggml_cuda_mmq_i64(ggml_cuda_mmq_get_config_ampere(type, J, fallback));
++        }
++#endif // GGML_CUDA_MMQ_I64
+         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+     }
+     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
+@@ -316,6 +336,8 @@
+         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+     }
+     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
++#elif defined(GGML_CUDA_MMQ_I64) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
++    return ggml_cuda_mmq_i64(ggml_cuda_mmq_get_config_ampere(type, J, fallback));
+ #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+ #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
+@@ -1714,8 +1736,14 @@
+     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
+     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+     const int ntiles_dst = args.ntj * nti * ntzw;
+-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
++#ifdef GGML_CUDA_MMQ_I64
++    // Blocks that run at once: with occupancy 2, a grid of nsm blocks would leave half of each SM's warps idle.
++    const int nsm_sk = nsm * config.occupancy;
++#else
++    const int nsm_sk = nsm;
++#endif // GGML_CUDA_MMQ_I64
++    const int tiles_nwaves = (ntiles_dst + nsm_sk - 1) / nsm_sk;
++    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm_sk*tiles_nwaves);
+ 
+     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+ 
+@@ -1723,7 +1751,7 @@
+     // GGML_CUDA_MMQ_SK_EFF: tiling efficiency (%) at or above which the stream-k kernel runs one block per tile and needs no fixup.
+     // Read on the host, so under CUDA graphs it is fixed at capture and costs nothing per step.
+     static const int sk_eff = [] { const char * e = getenv("GGML_CUDA_MMQ_SK_EFF"); return e ? atoi(e) : 90; }();
+-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= sk_eff ? ntiles_dst : std::min(nsm, nwork), 1, 1);
++    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= sk_eff ? ntiles_dst : std::min(nsm_sk, nwork), 1, 1);
+ 
+     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+ 
