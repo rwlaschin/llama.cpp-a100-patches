@@ -1,0 +1,392 @@
+--- a/ggml/src/ggml-cuda/mmq.cuh	2026-11-06 14:18:29
++++ b/ggml/src/ggml-cuda/mmq.cuh	2026-11-06 14:48:01
+@@ -3,6 +3,9 @@
+ #include "common.cuh"
+ #include "mmid.cuh"
+ #include "unary.cuh"
++#ifdef GGML_CUDA_MMQ_STAGE
++#include "cp-async.cuh"
++#endif // GGML_CUDA_MMQ_STAGE
+ 
+ #include <climits>
+ #include <cstdint>
+@@ -121,6 +124,10 @@
+ // block_q8_1_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
+ #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
+ 
++// GGML_CUDA_MMQ_STAGE: bytes per weight row in the shared staging buffer. cp.async copies 16 B aligned windows,
++// so a row's K-step chunk (at most 272 B, Q8_0) plus its 0..15 B misalignment must fit.
++#define MMQ_STAGE_ROW 288
++
+ // GGML_CUDA_MMQ_Y_ONCE: decode-sized tiles (J <= 32) load both halves of tile_y per K step, so the loop syncs twice
+ // per step instead of four times. Costs J*sizeof(block_q8_1_mmq) more shared memory; prefill tiles (J > 32) keep the split.
+ static constexpr __host__ __device__ bool ggml_cuda_mmq_y_once(int J) {
+@@ -463,8 +470,13 @@
+         const char * x_src = (i / R) % 2 == 0 ? x : x_gate;
+         return (const block_t *) x_src + kbx0 + ((i / (2*R))*R + i % R)*stride;
+     } else {
++#ifdef GGML_CUDA_MMQ_STAGE
++        // x_gate is the shared staging buffer here: row i was copied as the 16 B aligned window around its global chunk.
++        return (const block_t *) (x_gate + i*MMQ_STAGE_ROW + ((uintptr_t) ((const block_t *) x + kbx0 + i*stride) & 15));
++#else
+         GGML_UNUSED(x_gate);
+         return (const block_t *) x + kbx0 + i*stride;
++#endif // GGML_CUDA_MMQ_STAGE
+     }
+ }
+ 
+@@ -950,7 +962,13 @@
+     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1, has_fusion>();
+ 
+     extern __shared__ int data_mul_mat_q[];
+-    int * tile_y = data_mul_mat_q + J;
++#ifdef GGML_CUDA_MMQ_STAGE
++    constexpr bool stage_on = !has_fusion;
++#else
++    constexpr bool stage_on = false;
++#endif // GGML_CUDA_MMQ_STAGE
++    char * stage = (char *) (data_mul_mat_q + J);
++    int * tile_y = data_mul_mat_q + J + (stage_on ? I*MMQ_STAGE_ROW/4 : 0);
+     constexpr bool y_once = ggml_cuda_mmq_y_once(J);
+     constexpr int  y_half = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size); // the load loop writes whole thread-chunks, up to the pad
+     int * tile_x = tile_y + (y_once ? 2 : 1)*y_half;
+@@ -971,8 +989,40 @@
+ 
+     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+ 
++    // Raw copy of each weight row's K-step chunk into the staging buffer; load_tiles then converts from shared memory.
++    const auto stage_copy = [&](const int kb) {
++#ifdef GGML_CUDA_MMQ_STAGE
++        constexpr int bs = ggml_cuda_type_traits<type>::bs;
++        static_assert(blocks_per_iter*bs + 15 <= MMQ_STAGE_ROW, "K-step chunk does not fit MMQ_STAGE_ROW");
++        static_assert(I % (nwarps*warp_size/16) == 0, "stage copy covers 16 lanes per row");
++        const int t = threadIdx.y*warp_size + threadIdx.x;
++        const int c = t & 15;
++#pragma unroll
++        for (int i0 = 0; i0 < I; i0 += nwarps*warp_size/16) {
++            const int i = i0 + (t >> 4);
++            const uintptr_t a = (uintptr_t) (x + ((size_t) (offset_x + kb) + (size_t) min(i, tile_x_i_max)*stride_row_x)*bs);
++            const char * g = (const char *) (a & ~(uintptr_t) 15);
++            const int n = ((int) (a & 15) + blocks_per_iter*bs + 15) >> 4; // only the 16 B windows the loaders' bytes touch
++            const unsigned int s = ggml_cuda_cvta_generic_to_shared(stage + i*MMQ_STAGE_ROW);
++            // src-size 16 copies the window, 0 reads nothing and zero-fills: the row's window count is math, not a branch.
++            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" : : "r"(s + c*16),        "l"(g + c*16),        "r"(max(0, min(16, (n - c)*16))));
++            if (c < MMQ_STAGE_ROW/16 - 16) { // windows 16..17 of the 288 B row; a zero-fill still writes, so other lanes must not
++                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" : : "r"(s + (c + 16)*16), "l"(g + (c + 16)*16), "r"(max(0, min(16, (n - c - 16)*16))));
++            }
++        }
++#else
++        GGML_UNUSED(kb);
++#endif // GGML_CUDA_MMQ_STAGE
++    };
++
++    if constexpr (stage_on) {
++        stage_copy(kb0_start);
++        cp_async_wait_all();
++        __syncthreads();
++    }
++
+     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
++        load_tiles(x, stage_on ? (const char *) stage : x_gate, tile_x, offset_x + kb0, tile_x_i_max, stride_row_x);
+         {
+             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+ #pragma unroll
+@@ -993,15 +1043,28 @@
+             }
+ 
+             __syncthreads();
++            if constexpr (stage_on) {
++                if (kb0 + blocks_per_iter < kb0_stop) {
++                    stage_copy(kb0 + blocks_per_iter);
++                }
++            }
+ 
+             vec_dot(tile_x, tile_y, sum, 0);
+             vec_dot(tile_x, tile_y + y_half, sum, MMQ_TILE_NE_K);
+ 
++            if constexpr (stage_on) {
++                cp_async_wait_all();
++            }
+             __syncthreads();
+             continue;
+         }
+ 
+         __syncthreads();
++        if constexpr (stage_on) {
++            if (kb0 + blocks_per_iter < kb0_stop) {
++                stage_copy(kb0 + blocks_per_iter);
++            }
++        }
+ 
+         vec_dot(tile_x, tile_y, sum, 0);
+ 
+@@ -1021,6 +1084,9 @@
+ 
+         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+ 
++        if constexpr (stage_on) {
++            cp_async_wait_all();
++        }
+         __syncthreads();
+     }
+ 
+@@ -1466,7 +1532,12 @@
+     const size_t nbs_ids = config.J*sizeof(int);
+     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+-    return nbs_ids + nbs_x + (ggml_cuda_mmq_y_once(config.J) ? 2 : 1)*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
++#ifdef GGML_CUDA_MMQ_STAGE
++    const size_t nbs_stage = config.I*MMQ_STAGE_ROW;
++#else
++    const size_t nbs_stage = 0;
++#endif // GGML_CUDA_MMQ_STAGE
++    return nbs_ids + nbs_stage + nbs_x + (ggml_cuda_mmq_y_once(config.J) ? 2 : 1)*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+ }
+ 
+ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh	2026-11-06 14:18:29
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh	2026-11-06 14:18:49
+@@ -40,7 +40,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q1_0 * bxi = (const block_q1_0 *) x + kbx0 + i*stride + kbx;
++        const block_q1_0 * bxi = ggml_cuda_mmq_x_row<block_q1_0, false>(x, x_gate, kbx0, i, stride) + kbx;
+         const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 2;
+ 
+         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
+@@ -107,7 +107,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q1_0 * bxi = (const block_q1_0 *) x + kbx0 + i*stride + scale_block;
++        const block_q1_0 * bxi = ggml_cuda_mmq_x_row<block_q1_0, false>(x, x_gate, kbx0, i, stride) + scale_block;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_df[i*sram_stride                           + ksx] = bxi->d;
+@@ -153,7 +153,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + kbx;
++        const block_q2_0 * bxi = ggml_cuda_mmq_x_row<block_q2_0, false>(x, x_gate, kbx0, i, stride) + kbx;
+         const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 4;
+ 
+         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
+@@ -198,7 +198,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + scale_block;
++        const block_q2_0 * bxi = ggml_cuda_mmq_x_row<block_q2_0, false>(x, x_gate, kbx0, i, stride) + scale_block;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_df[i*sram_stride                           + ksx] = bxi->d;
+@@ -240,7 +240,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbx;
++        const block_q4_0 * bxi = ggml_cuda_mmq_x_row<block_q4_0, false>(x, x_gate, kbx0, i, stride) + kbx;
+         const int qs0 = get_int_b2(bxi->qs, kqsx);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+@@ -263,7 +263,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i*stride + kbxd;
++        const block_q4_0 * bxi = ggml_cuda_mmq_x_row<block_q4_0, false>(x, x_gate, kbx0, i, stride) + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_df[i*sram_stride                     + kbxd] = bxi->d;
+@@ -305,7 +305,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q4_1 * bxi = (const block_q4_1 *) x + kbx0 + i*stride + kbx;
++        const block_q4_1 * bxi = ggml_cuda_mmq_x_row<block_q4_1, false>(x, x_gate, kbx0, i, stride) + kbx;
+         const int qs0 = get_int_b4(bxi->qs, kqsx);
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+@@ -328,7 +328,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q4_1 * bxi = (const block_q4_1 *) x + kbx0 + i*stride + kbxd;
++        const block_q4_1 * bxi = ggml_cuda_mmq_x_row<block_q4_1, false>(x, x_gate, kbx0, i, stride) + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_dm[i*sram_stride                     + kbxd] = bxi->dm;
+@@ -370,7 +370,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q5_0 * bxi = (const block_q5_0 *) x + kbx0 + i*stride + kbx;
++        const block_q5_0 * bxi = ggml_cuda_mmq_x_row<block_q5_0, false>(x, x_gate, kbx0, i, stride) + kbx;
+ 
+         const int ql = get_int_b2(bxi->qs, kqsx);
+         const int qh = get_int_b2(bxi->qh, 0) >> (4 * kqsx);
+@@ -410,7 +410,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q5_0 * bxi = (const block_q5_0 *) x + kbx0 + i*stride + kbxd;
++        const block_q5_0 * bxi = ggml_cuda_mmq_x_row<block_q5_0, false>(x, x_gate, kbx0, i, stride) + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_df[i*sram_stride                     + kbxd] = bxi->d;
+@@ -452,7 +452,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q5_1 * bxi = (const block_q5_1 *) x + kbx0 + i*stride + kbx;
++        const block_q5_1 * bxi = ggml_cuda_mmq_x_row<block_q5_1, false>(x, x_gate, kbx0, i, stride) + kbx;
+ 
+         const int ql = get_int_b4(bxi->qs, kqsx);
+         const int qh = get_int_b4(bxi->qh, 0) >> (4 * kqsx);
+@@ -490,7 +490,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q5_1 * bxi = (const block_q5_1 *) x + kbx0 + i*stride + kbxd;
++        const block_q5_1 * bxi = ggml_cuda_mmq_x_row<block_q5_1, false>(x, x_gate, kbx0, i, stride) + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_dm[i*sram_stride                     + kbxd] = bxi->dm;
+@@ -596,7 +596,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q2_K * bxi = (const block_q2_K *) x + kbx0 + i*stride;
++        const block_q2_K * bxi = ggml_cuda_mmq_x_row<block_q2_K, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int x_ql_0 = get_int_b2(bxi->qs, kqsx);
+ 
+@@ -660,7 +660,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q3_K * bxi = (const block_q3_K *) x + kbx0 + i*stride;
++        const block_q3_K * bxi = ggml_cuda_mmq_x_row<block_q3_K, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int x_ql_0 = get_int_b2(bxi->qs,    kqsx);
+         const int x_qh_0 = get_int_b2(bxi->hmask, kqsx % (QI3_K/2)) >> (4 * (kqsx / (QI3_K/2)));
+@@ -691,7 +691,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q3_K * bxi = (const block_q3_K *) x + kbx0 + i*stride;
++        const block_q3_K * bxi = ggml_cuda_mmq_x_row<block_q3_K, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int ksc = threadIdx.x % 4;
+ 
+@@ -727,7 +727,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_q3_K * bxi = (const block_q3_K *) x + kbx0 + i*stride;
++        const block_q3_K * bxi = ggml_cuda_mmq_x_row<block_q3_K, false>(x, x_gate, kbx0, i, stride);
+ 
+         x_df[i] = bxi->d;
+     }
+@@ -1099,7 +1099,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq1_s * bxi = (const block_iq1_s *) x + kbx0 + i*stride;
++        const block_iq1_s * bxi = ggml_cuda_mmq_x_row<block_iq1_s, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int       qs_packed = get_int_b2(bxi->qs, kqsx);
+         const uint8_t * qs        = (const uint8_t *) &qs_packed;
+@@ -1163,7 +1163,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq2_xxs * bxi = (const block_iq2_xxs *) x + kbx0 + i*stride;
++        const block_iq2_xxs * bxi = ggml_cuda_mmq_x_row<block_iq2_xxs, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int q2 = get_int_b2(bxi->qs, 2*kqsx+0);
+         const uint8_t * aux8 = (const uint8_t *) &q2;
+@@ -1229,7 +1229,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq2_xs * bxi = (const block_iq2_xs *) x + kbx0 + i*stride;
++        const block_iq2_xs * bxi = ggml_cuda_mmq_x_row<block_iq2_xs, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int2 q2_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+         const uint16_t * q2 = (const uint16_t *) &q2_packed;
+@@ -1295,7 +1295,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq2_s * bxi = (const block_iq2_s *) x + kbx0 + i*stride;
++        const block_iq2_s * bxi = ggml_cuda_mmq_x_row<block_iq2_s, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int       qs_packed = get_int_b2(bxi->qs, kqsx);
+         const uint8_t * qs        = (const uint8_t *) &qs_packed;
+@@ -1366,7 +1366,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq3_xxs * bxi = (const block_iq3_xxs *) x + kbx0 + i*stride;
++        const block_iq3_xxs * bxi = ggml_cuda_mmq_x_row<block_iq3_xxs, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+         const uint8_t * q3 = (const uint8_t *) &q3_packed;
+@@ -1432,7 +1432,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
++        const block_iq3_s * bxi = ggml_cuda_mmq_x_row<block_iq3_s, false>(x, x_gate, kbx0, i, stride);
+ 
+         const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+         const uint8_t * qs        = (const uint8_t *) &qs_packed;
+@@ -1572,7 +1572,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq4_nl * bxi = (const block_iq4_nl *) x + kbx0 + i*stride + kbx;
++        const block_iq4_nl * bxi = ggml_cuda_mmq_x_row<block_iq4_nl, false>(x, x_gate, kbx0, i, stride) + kbx;
+ 
+         const int aux_q4 = get_int_b2(bxi->qs, kqsx);
+         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+@@ -1599,7 +1599,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_iq4_nl * bxi = (const block_iq4_nl *) x + kbx0 + i*stride + kbxd;
++        const block_iq4_nl * bxi = ggml_cuda_mmq_x_row<block_iq4_nl, false>(x, x_gate, kbx0, i, stride) + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_df[i*sram_stride                       + kbxd] = __half2float(bxi->d);
+@@ -1643,7 +1643,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
++        const block_mxfp4 * bxi = ggml_cuda_mmq_x_row<block_mxfp4, false>(x, x_gate, kbx0, i, stride) + kbx;
+ 
+         const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+@@ -1670,7 +1670,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
++        const block_mxfp4 * bxi = ggml_cuda_mmq_x_row<block_mxfp4, false>(x, x_gate, kbx0, i, stride) + kbxd;
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+         x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+@@ -1709,7 +1709,7 @@
+             i = min(i, i_max);
+         }
+ 
+-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i * stride + kbx;
++        const block_mxfp4 * bxi = ggml_cuda_mmq_x_row<block_mxfp4, false>(x, x_gate, kbx0, i, stride) + kbx;
+ 
+         // quantize_mxfp4_mmq permutes nibbles to match the quantized format
+         const int k0 = kbx * 4;
