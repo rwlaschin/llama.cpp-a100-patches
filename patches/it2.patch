@@ -1,0 +1,144 @@
+--- a/src/llama-model.cpp	2026-11-07 02:56:14
++++ b/src/llama-model.cpp	2026-11-07 03:48:09
+@@ -2137,8 +2137,92 @@
+     }
+ 
+     load_tensors_hadamard();
++    load_tensors_beta_alpha_cat();
+ 
+     return true;
++}
++
++// beta and alpha read the same input; one [beta | alpha] matmul halves the tiny-matmul count per GDN layer.
++// Rows are contiguous in every quantized type, so the merged weight is the byte concatenation of the two.
++// Runs after load_all_data: the copy reads the loaded weights and lands in their own buffer type (the GPU).
++void llama_model_base::load_tensors_beta_alpha_cat() {
++    // only the qwen35 graph reads ssm_beta_alpha_cat; other archs would pay the VRAM for nothing
++    if (arch != LLM_ARCH_QWEN35) {
++        return;
++    }
++
++    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctxs;
++    for (size_t il = 0; il < layers.size(); ++il) {
++        auto & layer = layers[il];
++        ggml_tensor * b = layer.ssm_beta;
++        ggml_tensor * a = layer.ssm_alpha;
++        if (!b || !a || !b->buffer || !a->buffer || b->type != a->type || b->ne[0] != a->ne[0] || b->ne[1] != a->ne[1]) {
++            continue;
++        }
++        // per-tensor scales, Hadamard folds and precision policies are keyed to the separate weights: keep the two-matmul path
++        if (layer.ssm_beta_s || layer.ssm_alpha_s || layer.ssm_beta_in_s || layer.ssm_alpha_in_s ||
++            hdmd.rot.count(b) || hdmd.rot.count(a) ||
++            prec_policy.prec_src1.count(b) || prec_policy.prec_src1.count(a) ||
++            prec_policy.prec_acc.count(b) || prec_policy.prec_acc.count(a)) {
++            continue;
++        }
++        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(b->buffer);
++        if (buft != ggml_backend_buffer_get_type(a->buffer)) {
++            continue;
++        }
++        // a CPU extra buffer type (e.g. CPU_REPACK) does not hold the GGUF byte layout
++        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
++            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && buft != ggml_backend_dev_buffer_type(dev)) {
++                continue;
++            }
++        }
++
++        auto & ctx = ctxs[buft];
++        if (!ctx) {
++            ggml_init_params params = {
++                /*.mem_size   =*/ ggml_tensor_overhead() * layers.size(),
++                /*.mem_buffer =*/ NULL,
++                /*.no_alloc   =*/ true,
++            };
++            ctx.reset(ggml_init(params));
++            if (!ctx) {
++                throw std::runtime_error("failed to create beta_alpha context");
++            }
++        }
++        layer.ssm_beta_alpha_cat = ggml_new_tensor_2d(ctx.get(), b->type, b->ne[0], b->ne[1] + a->ne[1]);
++        ggml_format_name(layer.ssm_beta_alpha_cat, "blk.%zu.ssm_beta_alpha.weight", il);
++    }
++
++    for (auto & [buft, ctx] : ctxs) {
++        ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
++        if (!buffer) {
++            throw std::runtime_error(format("unable to allocate %s beta_alpha buffer", ggml_backend_buft_name(buft)));
++        }
++        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        std::vector<ggml_backend_buffer_ptr> buffers;
++        buffers.emplace_back(std::move(buffer));
++        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
++    }
++
++    std::vector<uint8_t> data;
++    size_t n_cat = 0;
++    for (auto & layer : layers) {
++        ggml_tensor * cat = layer.ssm_beta_alpha_cat;
++        if (!cat) {
++            continue;
++        }
++        const size_t nb = ggml_nbytes(layer.ssm_beta);
++        const size_t na = ggml_nbytes(layer.ssm_alpha);
++        GGML_ASSERT(nb + na == ggml_nbytes(cat));
++        data.resize(nb + na);
++        ggml_backend_tensor_get(layer.ssm_beta,  data.data(),      0, nb);
++        ggml_backend_tensor_get(layer.ssm_alpha, data.data() + nb, 0, na);
++        ggml_backend_tensor_set(cat, data.data(), 0, nb + na);
++        n_cat++;
++    }
++    if (n_cat) {
++        LLAMA_LOG_INFO("%s: merged ssm_beta|ssm_alpha into one weight for %zu layer(s)\n", __func__, n_cat);
++    }
+ }
+ 
+ // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+--- a/src/llama-model.h	2026-11-07 02:56:14
++++ b/src/llama-model.h	2026-11-07 03:47:49
+@@ -1043,6 +1043,9 @@
+     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
+     void load_tensors_hadamard();
+ 
++    // helper: build the [ssm_beta | ssm_alpha] weight per GDN layer when the GGUF stores them apart
++    void load_tensors_beta_alpha_cat();
++
+     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
+     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
+ 
+--- a/src/models/qwen35.cpp	2026-11-07 02:56:14
++++ b/src/models/qwen35.cpp	2026-11-07 03:48:24
+@@ -367,15 +367,30 @@
+     ggml_tensor * qkv_mixed = qkvz.first;
+     ggml_tensor * z         = qkvz.second;
+ 
+-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
++    ggml_tensor * beta  = nullptr;
++    ggml_tensor * alpha = nullptr;
++    // LoRA deltas are looked up by the separate weights, so an adapter keeps the two-matmul path
++    if (model.layers[il].ssm_beta_alpha_cat && loras->empty()) {
++        // beta and alpha read the same input: one matmul, then the beta rows and the alpha rows
++        ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
++        cb(ba, "beta_alpha", il);
++
++        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
++                ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
++        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
++                ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
++    } else {
++        beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
++        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
++
++        alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
++        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
++    }
+     cb(beta, "beta", il);
+ 
+     beta = ggml_sigmoid(ctx0, beta);
+     cb(beta, "beta_sigmoid", il);
+ 
+-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 
+     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
