@@ -1,0 +1,131 @@
+--- a/src/llama-graph.cpp	2026-11-06 15:03:01
++++ b/src/llama-graph.cpp	2026-11-06 15:03:10
+@@ -401,7 +401,7 @@
+ 
+     const int64_t n_rs = mctx->get_n_rs();
+ 
+-    if (s_copy) {
++    if (s_copy && s_copy->buffer) { // an in-place graph never reads s_copy, so it has no buffer
+         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+         int32_t * data = (int32_t *) s_copy->data;
+ 
+@@ -425,6 +425,7 @@
+ 
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
++    res &= in_place == mctx->s_copy_is_identity();
+ 
+     return res;
+ }
+@@ -1186,7 +1187,7 @@
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1215,6 +1216,7 @@
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= inp_rs->in_place == mctx->get_recr()->s_copy_is_identity();
+ 
+     return res;
+ }
+@@ -1232,7 +1234,7 @@
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1305,7 +1307,7 @@
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1347,6 +1349,8 @@
+ 
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
++    res &= inp_rs->in_place == mctx->get_recr()->s_copy_is_identity();
++    res &= inp_rs->in_place == mctx->get_recr()->s_copy_is_identity();
+ 
+     return res;
+ }
+@@ -3956,6 +3960,7 @@
+ 
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
++    inp->in_place = mctx_cur->s_copy_is_identity();
+ 
+     return inp;
+ }
+@@ -3975,6 +3980,14 @@
+             int32_t   n_seqs,
+         const llm_graph_get_rows_fn & get_state_rows) const {
+     const auto * kv_state = inp->mctx;
++
++    if (inp->in_place && !get_state_rows) {
++        ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
++        const int32_t rs_zero = kv_state->get_rs_z();
++        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
++        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
++        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], kv_state->get_head()*states->nb[1]);
++    }
+ 
+     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
+     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
+--- a/src/llama-graph.h	2026-11-06 15:03:01
++++ b/src/llama-graph.h	2026-11-06 15:03:01
+@@ -299,6 +299,9 @@
+     // used in view offsets, need to match for valid graph reuse
+     uint32_t head;
+     int32_t rs_z;
++
++    // the gather of the states would copy every row onto itself: build_rs reads them in place
++    bool in_place;
+ };
+ 
+ class llm_graph_input_cross_embd : public llm_graph_input_i {
+--- a/src/llama-memory-recurrent.cpp	2026-11-06 15:03:01
++++ b/src/llama-memory-recurrent.cpp	2026-11-06 15:03:01
+@@ -1356,6 +1356,18 @@
+ 
+ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+     return mem->p_l[il];
++}
++
++bool llama_memory_recurrent_context::s_copy_is_identity() const {
++    if (is_full || mem->n_rs_seq != 0) {
++        return false;
++    }
++    for (uint32_t i = mem->head; i < mem->head + mem->n; ++i) {
++        if (mem->cells[i].src0 != (int32_t) i) {
++            return false;
++        }
++    }
++    return true;
+ }
+ 
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+--- a/src/llama-memory-recurrent.h	2026-11-06 15:03:01
++++ b/src/llama-memory-recurrent.h	2026-11-06 15:03:01
+@@ -183,6 +183,9 @@
+ 
+     int32_t s_copy(int i) const;
+ 
++    // true when every cell of the ubatch range already holds its own state (s_copy(i) == head + i)
++    bool s_copy_is_identity() const;
++
+ private:
+     const llama_memory_status status;
+ 
