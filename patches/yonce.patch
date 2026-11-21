@@ -1,0 +1,65 @@
+--- a/ggml/src/ggml-cuda/mmq.cuh	2026-11-06 13:15:03
++++ b/ggml/src/ggml-cuda/mmq.cuh	2026-11-06 14:11:48
+@@ -120,6 +120,16 @@
+ 
+ // block_q8_1_mmq has (128 8-bit ints == 32 32-bit ints + 4 32-bit scales)
+ #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
++
++// GGML_CUDA_MMQ_Y_ONCE: decode-sized tiles (J <= 32) load both halves of tile_y per K step, so the loop syncs twice
++// per step instead of four times. Costs J*sizeof(block_q8_1_mmq) more shared memory; prefill tiles (J > 32) keep the split.
++static constexpr __host__ __device__ bool ggml_cuda_mmq_y_once(int J) {
++#ifdef GGML_CUDA_MMQ_Y_ONCE
++    return J <= 32;
++#else
++    return (void) J, false;
++#endif // GGML_CUDA_MMQ_Y_ONCE
++}
+ #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
+ 
+ enum ggml_cuda_mmq_sram_layout {
+@@ -941,7 +951,9 @@
+ 
+     extern __shared__ int data_mul_mat_q[];
+     int * tile_y = data_mul_mat_q + J;
+-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
++    constexpr bool y_once = ggml_cuda_mmq_y_once(J);
++    constexpr int  y_half = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size); // the load loop writes whole thread-chunks, up to the pad
++    int * tile_x = tile_y + (y_once ? 2 : 1)*y_half;
+ 
+ #if defined(BLACKWELL_MMA_AVAILABLE)
+     // FP4 tile stores 8 blocks. src1 above Q4 uses the generic
+@@ -968,7 +980,25 @@
+                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+ 
+                 tile_y[l] = by0[l];
++            }
++        }
++
++        if constexpr (y_once) {
++            const int * by1 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
++#pragma unroll
++            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                tile_y[y_half + l] = by1[l];
+             }
++
++            __syncthreads();
++
++            vec_dot(tile_x, tile_y, sum, 0);
++            vec_dot(tile_x, tile_y + y_half, sum, MMQ_TILE_NE_K);
++
++            __syncthreads();
++            continue;
+         }
+ 
+         __syncthreads();
+@@ -1436,7 +1466,7 @@
+     const size_t nbs_ids = config.J*sizeof(int);
+     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
++    return nbs_ids + nbs_x + (ggml_cuda_mmq_y_once(config.J) ? 2 : 1)*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+ }
+ 
+ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
