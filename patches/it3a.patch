@@ -1,0 +1,169 @@
+diff -ruN ../base0/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+--- ../base0/ggml/src/ggml-cuda/common.cuh	2026-11-07 02:56:14
++++ b/ggml/src/ggml-cuda/common.cuh	2026-11-07 23:54:35
+@@ -1575,6 +1575,22 @@
+     ggml_cuda_pool & pool() {
+         return pool(device);
+     }
++
++#ifdef GGML_CUDA_MMQ_Q8_CACHE
++    // MMQ-quantized src1 reused by the MUL_MATs of one graph that read the same activation (q/k/v). Reset per graph compute;
++    // a bump ring that wipes when full (stream-ordered, so a wipe is safe on one stream). The ring sizes itself: it holds two
++    // of the largest activation seen (the one being read by its siblings plus the next), grows to that at the next graph start
++    // when the device has room, and anything it cannot hold is quantized per call as before. Old segments stay allocated:
++    // captured CUDA graphs point into them.
++    struct mmq_q8_entry { const ggml_tensor * src1; const void * data; cudaStream_t stream; int layout; size_t nbytes; char * ptr; };
++    mmq_q8_entry mmq_q8_entries[8] = {};
++    int    mmq_q8_n    = 0;
++    size_t mmq_q8_used = 0;       // bump offset in the current segment
++    size_t mmq_q8_want = 0;       // ring size the activations seen so far call for
++    size_t mmq_q8_cap  = 0;       // current segment size
++    char * mmq_q8_cur  = nullptr;
++    std::vector<void *> mmq_q8_segs;
++#endif // GGML_CUDA_MMQ_Q8_CACHE
+ };
+ 
+ struct ggml_cuda_mm_fusion_args_host {
+diff -ruN ../base0/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- ../base0/ggml/src/ggml-cuda/ggml-cuda.cu	2026-11-07 02:56:14
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-11-08 00:24:01
+@@ -746,6 +746,11 @@
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
++#ifdef GGML_CUDA_MMQ_Q8_CACHE
++    for (void * seg : mmq_q8_segs) {
++        CUDA_CHECK(cudaFree(seg));
++    }
++#endif // GGML_CUDA_MMQ_Q8_CACHE
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -4883,6 +4888,36 @@
+ 
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
++#ifdef GGML_CUDA_MMQ_Q8_CACHE
++    // GGML_CUDA_MMQ_Q8_CACHE=<MiB> in the environment pins the ring to that size and turns discovery off, so a fleet that
++    // restarts all day does not rediscover it; unset, the ring grows to what the activations call for and logs the size it
++    // settled on, which is the value to set. Growth happens between graphs, never inside one (a pool-free ordering and a
++    // capture both assume the layout is fixed), and only out of memory the device reports free, leaving as much again.
++    static const size_t mmq_q8_set = [] { const char * e = getenv("GGML_CUDA_MMQ_Q8_CACHE"); return e ? ((size_t) atoi(e)) << 20 : 0; }();
++    const size_t mmq_q8_target = mmq_q8_set ? (cuda_ctx->mmq_q8_cap ? 0 : mmq_q8_set) : cuda_ctx->mmq_q8_want;
++    if (mmq_q8_target > cuda_ctx->mmq_q8_cap) {
++        size_t free = 0, total = 0;
++        CUDA_CHECK(cudaMemGetInfo(&free, &total));
++        void * seg = nullptr;
++        if ((mmq_q8_set || mmq_q8_target <= free / 2) && cudaMalloc(&seg, mmq_q8_target) == cudaSuccess) {
++            cuda_ctx->mmq_q8_segs.push_back(seg);
++            cuda_ctx->mmq_q8_cur = (char *) seg;
++            cuda_ctx->mmq_q8_cap = mmq_q8_target;
++            // WARN, not INFO: llama-server hides ggml INFO lines at its default verbosity, and this line exists to be read
++            GGML_LOG_WARN("%s: MMQ q8 cache ring %zu MiB on %s (%s; set GGML_CUDA_MMQ_Q8_CACHE=%zu to pin it)\n", __func__,
++                (mmq_q8_target + (1 << 20) - 1) >> 20, cuda_ctx->name.c_str(), mmq_q8_set ? "set" : "discovered", (mmq_q8_target + (1 << 20) - 1) >> 20);
++        } else {
++            (void) cudaGetLastError(); // a refused malloc leaves its error pending; the ring keeps its size
++            if (mmq_q8_set) {
++                GGML_LOG_WARN("%s: MMQ q8 cache ring %zu MiB not allocated on %s (free %zu MiB); running without it\n", __func__,
++                    mmq_q8_target >> 20, cuda_ctx->name.c_str(), free >> 20);
++                cuda_ctx->mmq_q8_cap = 1; // stops the retry; nothing fits a 1-byte ring
++            }
++        }
++    }
++    cuda_ctx->mmq_q8_n    = 0;
++    cuda_ctx->mmq_q8_used = 0;
++#endif // GGML_CUDA_MMQ_Q8_CACHE
+ 
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+diff -ruN ../base0/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+--- ../base0/ggml/src/ggml-cuda/mmq.cu	2026-11-07 02:56:14
++++ b/ggml/src/ggml-cuda/mmq.cu	2026-11-07 23:54:39
+@@ -171,6 +171,38 @@
+     return J_best;
+ }
+ 
++#ifdef GGML_CUDA_MMQ_Q8_CACHE
++// Arena slot holding src1 quantized for `layout`; `fresh` says it still has to be quantized. nullptr = not cacheable.
++static char * mmq_q8_cache_get(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int layout, const size_t nbytes,
++        cudaStream_t stream, bool & fresh) {
++    if (!ctx.stream_context().concurrent_events.empty()) { // multi-stream graph: a wipe could race a reader on another stream
++        return nullptr;
++    }
++    for (int i = 0; i < ctx.mmq_q8_n; i++) {
++        const auto & e = ctx.mmq_q8_entries[i];
++        if (e.src1 == src1 && e.data == src1->data && e.layout == layout && e.stream == stream && e.nbytes >= nbytes) {
++            fresh = false;
++            return e.ptr;
++        }
++    }
++    // two of the largest activation: the one its siblings are still reading, plus the next one, so a wipe never evicts a live entry
++    ctx.mmq_q8_want = std::max(ctx.mmq_q8_want, 2 * GGML_PAD(nbytes, 256));
++    if (nbytes > ctx.mmq_q8_cap) {
++        return nullptr;
++    }
++    size_t off = GGML_PAD(ctx.mmq_q8_used, 256);
++    if (ctx.mmq_q8_n == 8 || off + nbytes > ctx.mmq_q8_cap) {
++        ctx.mmq_q8_n = 0;
++        off = 0;
++    }
++    char * p = ctx.mmq_q8_cur + off;
++    ctx.mmq_q8_entries[ctx.mmq_q8_n++] = { src1, src1->data, stream, layout, nbytes, p };
++    ctx.mmq_q8_used = off + nbytes;
++    fresh = true;
++    return p;
++}
++#endif // GGML_CUDA_MMQ_Q8_CACHE
++
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -274,13 +306,23 @@
+         const int ntj = (ne1 + J_best - 1) / J_best;
+ 
+         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
+-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
++        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
++        char * src1_q8_1_ptr = nullptr;
++        bool   quantize      = true;
++#ifdef GGML_CUDA_MMQ_Q8_CACHE
++        if (!use_native_fp4) {
++            src1_q8_1_ptr = mmq_q8_cache_get(ctx, src1, mmq_get_q8_1_ds_layout(src0->type), nbytes_src1_q8_1, stream, quantize);
++        }
++#endif // GGML_CUDA_MMQ_Q8_CACHE
++        if (!src1_q8_1_ptr) {
++            src1_q8_1_ptr = src1_q8_1.alloc(nbytes_src1_q8_1);
++        }
+         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+             src1_scale.alloc(ne13*ne12*ne11);
+         }
+ 
+-        {
++        if (quantize) {
+             const int64_t s11 = src1->nb[1] / ts_src1;
+             const int64_t s12 = src1->nb[2] / ts_src1;
+             const int64_t s13 = src1->nb[3] / ts_src1;
+@@ -288,11 +330,11 @@
+                 static constexpr size_t align_float8 = 32;
+                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
+                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
+-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
++                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1_ptr, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                                         ne11, ne12, ne13, stream);
+ 
+             } else {
+-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
++                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
+             }
+             CUDA_CHECK(cudaGetLastError());
+@@ -305,7 +347,7 @@
+         const int64_t s13 = ne12*s12;
+ 
+         const mmq_args args = {
+-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
++            src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr, dst_d,
+             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
+             ne00, ne01, ne1, s01, ne11, s1,
+             ne02, ne12, s02, s12, s2,
