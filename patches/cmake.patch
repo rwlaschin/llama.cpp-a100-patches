@@ -1,0 +1,43 @@
+--- a/ggml/CMakeLists.txt	2026-11-08 10:28:22
++++ b/ggml/CMakeLists.txt	2026-11-08 10:28:22
+@@ -201,6 +201,15 @@
+ option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
+ option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
+ option(GGML_CUDA_FORCE_CUBLAS               "ggml: always use cuBLAS instead of mmq kernels"  OFF)
++option(GGML_CUDA_MMQ_I2F_EXACT              "ggml: mmq: exact int-to-float conversion in the dot products"  OFF)
++option(GGML_CUDA_MMQ_Y_ONCE                 "ggml: mmq: load both halves of the y tile per K step (J <= 32)" OFF)
++option(GGML_CUDA_MMQ_STAGE                  "ggml: mmq: stage weight tiles in shared memory with cp.async"   OFF)
++option(GGML_CUDA_MMQ_STAGE_RING             "ggml: mmq: double-buffer the staged weight tiles"               OFF)
++option(GGML_CUDA_MMQ_STAGE_LINEAR           "ggml: mmq: linear thread-to-chunk staging copy"                 OFF)
++option(GGML_CUDA_MMQ_Y_ASYNC                "ggml: mmq: async y tile loads over the staged weights"          OFF)
++option(GGML_CUDA_MMQ_Q8_CACHE               "ggml: mmq: quantize each activation to q8_1 once per graph"     OFF)
++set   (GGML_CUDA_MMQ_CUBLAS_ABOVE "0" CACHE STRING "ggml: mmq: use cuBLAS for batches of at least this many columns, 0 to keep mmq")
++set   (GGML_CUDA_MMQ_STAGE_STRIDE "" CACHE STRING "ggml: mmq: bytes between staged weight rows, empty for the default")
+ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
+ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
+ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
+--- a/ggml/src/ggml-cuda/CMakeLists.txt	2026-11-08 10:28:22
++++ b/ggml/src/ggml-cuda/CMakeLists.txt	2026-11-08 10:28:40
+@@ -142,8 +142,22 @@
+ 
+     if (GGML_CUDA_FORCE_CUBLAS)
+         add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
++    endif()
++
++    foreach (opt I2F_EXACT Y_ONCE STAGE STAGE_RING STAGE_LINEAR Y_ASYNC Q8_CACHE)
++        if (GGML_CUDA_MMQ_${opt})
++            add_compile_definitions(GGML_CUDA_MMQ_${opt})
++        endif()
++    endforeach()
++
++    if (GGML_CUDA_MMQ_CUBLAS_ABOVE GREATER 0)
++        add_compile_definitions(GGML_CUDA_MMQ_CUBLAS_ABOVE=${GGML_CUDA_MMQ_CUBLAS_ABOVE})
+     endif()
+ 
++    if (GGML_CUDA_MMQ_STAGE_STRIDE)
++        add_compile_definitions(GGML_CUDA_MMQ_STAGE_STRIDE=${GGML_CUDA_MMQ_STAGE_STRIDE})
++    endif()
++
+     if (GGML_CUDA_NO_VMM)
+         add_compile_definitions(GGML_CUDA_NO_VMM)
+     endif()
