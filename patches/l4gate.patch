@@ -1,0 +1,105 @@
+--- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
++++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+@@ -10,12 +10,13 @@
+ // GGML_CUDA_MMQ_I2F_EXACT: one int8 MMA result is at most 32*128*128 = 2^19 in magnitude, so adding it into the
+ // mantissa of 1.5*2^23 and subtracting that back gives exactly (float) x, from full-rate IADD + FADD instead of the
+ // quarter-rate I2F convert.
++// The trick pays on the GA100 (quarter-rate I2F); it measured -8% prompt t/s on the L4, so GA100 only.
+ static __device__ __forceinline__ float ggml_cuda_mmq_i2f(const int x) {
+-#ifdef GGML_CUDA_MMQ_I2F_EXACT
++#if defined(GGML_CUDA_MMQ_I2F_EXACT) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
+     return __int_as_float(x + 0x4B400000) - 12582912.0f;
+ #else
+     return (float) x;
+-#endif // GGML_CUDA_MMQ_I2F_EXACT
++#endif // defined(GGML_CUDA_MMQ_I2F_EXACT) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
+ }
+ 
+ template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -477,13 +477,13 @@
+         const char * x_src = (i / R) % 2 == 0 ? x : x_gate;
+         return (const block_t *) x_src + kbx0 + ((i / (2*R))*R + i % R)*stride;
+     } else {
+-#ifdef GGML_CUDA_MMQ_STAGE
++#if defined(GGML_CUDA_MMQ_STAGE) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
+         // x_gate is the shared staging buffer here: row i was copied as the 16 B aligned window around its global chunk.
+         return (const block_t *) (x_gate + i*GGML_CUDA_MMQ_STAGE_STRIDE +((uintptr_t) ((const block_t *) x + kbx0 + i*stride) & 15));
+ #else
+         GGML_UNUSED(x_gate);
+         return (const block_t *) x + kbx0 + i*stride;
+-#endif // GGML_CUDA_MMQ_STAGE
++#endif // defined(GGML_CUDA_MMQ_STAGE) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
+     }
+ }
+ 
+@@ -969,11 +969,13 @@
+     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback, prec_src1, has_fusion>();
+ 
+     extern __shared__ int data_mul_mat_q[];
+-#ifdef GGML_CUDA_MMQ_STAGE
++    // Staging spends shared memory to hide weight-load latency: it fits the GA100 (164 KB) and measured -4% prompt t/s
++    // on the L4 (100 KB), so it compiles in for GA100 only. mmq_get_nbytes_shared sizes shared memory the same way.
++#if defined(GGML_CUDA_MMQ_STAGE) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
+     constexpr bool stage_on = !has_fusion;
+ #else
+     constexpr bool stage_on = false;
+-#endif // GGML_CUDA_MMQ_STAGE
++#endif // defined(GGML_CUDA_MMQ_STAGE) && __CUDA_ARCH__ == GGML_CUDA_CC_AMPERE
+ #if defined(GGML_CUDA_MMQ_STAGE) && defined(GGML_CUDA_MMQ_STAGE_RING)
+     // GGML_CUDA_MMQ_STAGE_RING: two weight stages, so the copy for K-step k+2 is in flight while k+1 is converted and
+     // multiplied. Costs another I*STRIDE bytes of shared memory per block: fits an A100 (164 KB), not an L4 (100 KB).
+@@ -1059,7 +1061,9 @@
+     const auto stage_copy = [&](const int kb) {
+ #ifdef GGML_CUDA_MMQ_STAGE
+         constexpr int bs = ggml_cuda_type_traits<type>::bs;
+-        static_assert(blocks_per_iter*bs + 15 <= MMQ_STAGE_ROW, "K-step chunk does not fit MMQ_STAGE_ROW");
++        // Staging geometry binds only where staging compiles in (stage_on, GA100): the Blackwell FP4 W4A4 K-step is larger
++        // and is never staged.
++        static_assert(!stage_on || blocks_per_iter*bs + 15 <= MMQ_STAGE_ROW, "K-step chunk does not fit MMQ_STAGE_ROW");
+         const int t = threadIdx.y*warp_size + threadIdx.x;
+         char * stage = stage_at(kb);
+ #ifdef GGML_CUDA_MMQ_STAGE_LINEAR
+@@ -1067,7 +1071,7 @@
+         // 8-lane phase writes one aligned 128 B line. Per-row lanes put 3 of 4 rows (288 B apart) across two lines.
+         constexpr int R  = GGML_CUDA_MMQ_STAGE_STRIDE/16; // chunks per staged row
+         constexpr int nt = nwarps*warp_size;
+-        static_assert(I*R % nt == 0, "linear stage copy: chunks must split evenly over the threads");
++        static_assert(!stage_on || I*R % nt == 0, "linear stage copy: chunks must split evenly over the threads");
+ #pragma unroll
+         for (int q0 = 0; q0 < I*R; q0 += nt) {
+             const int q = q0 + t;
+@@ -1080,7 +1084,7 @@
+             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" : : "r"(s), "l"(g + c*16), "r"(max(0, min(16, (n - c)*16))));
+         }
+ #else
+-        static_assert(I % (nwarps*warp_size/16) == 0, "stage copy covers 16 lanes per row");
++        static_assert(!stage_on || I % (nwarps*warp_size/16) == 0, "stage copy covers 16 lanes per row");
+         const int c = t & 15;
+ #pragma unroll
+         for (int i0 = 0; i0 < I; i0 += nwarps*warp_size/16) {
+@@ -1639,15 +1643,19 @@
+     const size_t nbs_ids = config.J*sizeof(int);
+     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+-#if defined(GGML_CUDA_MMQ_STAGE) && defined(GGML_CUDA_MMQ_STAGE_RING)
+-    const size_t nbs_stage = 2*config.I*GGML_CUDA_MMQ_STAGE_STRIDE;
++#ifdef GGML_CUDA_MMQ_STAGE
++    // The arch of the code the device actually runs, so this agrees with the kernel's __CUDA_ARCH__ test.
++    const bool stage_on = ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_AMPERE;
++#endif // GGML_CUDA_MMQ_STAGE
++#if defined(GGML_CUDA_MMQ_STAGE) && defined(GGML_CUDA_MMQ_STAGE_RING)
++    const size_t nbs_stage = stage_on ? 2*config.I*GGML_CUDA_MMQ_STAGE_STRIDE : 0;
+ #elif defined(GGML_CUDA_MMQ_STAGE)
+-    const size_t nbs_stage = config.I*GGML_CUDA_MMQ_STAGE_STRIDE;
++    const size_t nbs_stage = stage_on ? config.I*GGML_CUDA_MMQ_STAGE_STRIDE : 0;
+ #else
+     const size_t nbs_stage = 0;
+ #endif // GGML_CUDA_MMQ_STAGE
+ #if defined(GGML_CUDA_MMQ_STAGE) && defined(GGML_CUDA_MMQ_Y_ASYNC)
+-    const int n_y = ggml_cuda_mmq_y_once(config.J) ? 4 : 1;
++    const int n_y = ggml_cuda_mmq_y_once(config.J) ? (stage_on ? 4 : 2) : 1;
+ #else
+     const int n_y = ggml_cuda_mmq_y_once(config.J) ? 2 : 1;
+ #endif // GGML_CUDA_MMQ_Y_ASYNC
