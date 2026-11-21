@@ -1,0 +1,168 @@
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -96,28 +96,46 @@
+     int equal_count;
+ };
+ 
+-static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
+-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (row < nrows) {
++// Zeroes each row's per-pass histograms and done counters too, so the passes need no separate reset kernels.
++template<int NBINS, int NPASS>
++static __global__ void top_k_radix_init(top_k_radix_state * states, int * row_histograms, int * done, int nrows, int k) {
++    const int row = blockIdx.x;
++    for (int i = threadIdx.x; i < NPASS*NBINS; i += blockDim.x) {
++        row_histograms[(size_t) row*NPASS*NBINS + i] = 0;
++    }
++    if (threadIdx.x < NPASS) {
++        done[row*NPASS + threadIdx.x] = 0;
++    }
++    if (threadIdx.x == 0) {
+         states[row] = {0, 0, k, 0, 0};
+     }
++    GGML_UNUSED(nrows);
+ }
+ 
++// One launch per radix pass: every block adds its counts into the row's histogram for this pass, and the last
++// block to finish (threadfence + done counter) picks the bin, so no separate select kernel has to scan the
++// per-block histograms.
+ template<int BLOCK_SIZE, int RADIX_BITS>
+ static __global__ void top_k_radix_histogram(
+         const float * __restrict__ src,
+-        const top_k_radix_state * __restrict__ states,
+-        int * __restrict__ block_histograms,
++        top_k_radix_state * __restrict__ states,
++        int * __restrict__ row_histograms,
++        int * __restrict__ done,
+         int ncols,
+         int blocks_per_row,
+-        int shift) {
++        int shift,
++        int pass,
++        int npass) {
+     constexpr int NBINS = 1 << RADIX_BITS;
++    static_assert(NBINS == BLOCK_SIZE, "one bin per thread");
+ 
+     const int row = blockIdx.x / blocks_per_row;
+     const int row_block = blockIdx.x % blocks_per_row;
+     const int tid = threadIdx.x;
+     const float * row_src = src + (size_t) row * ncols;
++    int * row_hist = row_histograms + ((size_t) row*npass + pass)*NBINS;
+     __shared__ int histogram[NBINS];
++    __shared__ bool is_last;
+ 
+     histogram[tid] = 0;
+     __syncthreads();
+@@ -133,51 +151,36 @@
+     }
+     __syncthreads();
+ 
+-    const size_t histogram_offset =
+-        ((size_t) row * blocks_per_row + row_block) * NBINS;
+-    block_histograms[histogram_offset + tid] = histogram[tid];
+-}
++    if (histogram[tid] != 0) {
++        atomicAdd(&row_hist[tid], histogram[tid]);
++    }
++    __threadfence();
++    __syncthreads();
+ 
+-template<int BLOCK_SIZE, int RADIX_BITS>
+-static __global__ void top_k_radix_select(
+-        const int * __restrict__ block_histograms,
+-        top_k_radix_state * __restrict__ states,
+-        int blocks_per_row,
+-        int shift) {
+-    constexpr int NBINS = 1 << RADIX_BITS;
+-
+-    const int row = blockIdx.x;
+-    const int tid = threadIdx.x;
+-    __shared__ int histogram[NBINS];
+-
+-    int count = 0;
+-    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
+-        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
+-        count += block_histograms[offset + tid];
++    if (tid == 0) {
++        is_last = atomicAdd(&done[row*npass + pass], 1) == blocks_per_row - 1;
++    }
++    __syncthreads();
++    if (!is_last) {
++        return;
+     }
+-    histogram[tid] = count;
++
++    __threadfence();
++    histogram[tid] = ((volatile int *) row_hist)[tid];
+     __syncthreads();
+ 
+     if (tid == 0) {
+-        top_k_radix_state state = states[row];
++        top_k_radix_state s = state;
+         int bin = NBINS - 1;
+-        while (bin > 0 && histogram[bin] < state.rank) {
+-            state.rank -= histogram[bin--];
++        while (bin > 0 && histogram[bin] < s.rank) {
++            s.rank -= histogram[bin--];
+         }
+-        state.prefix |= (uint32_t) bin << shift;
+-        state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+-        states[row] = state;
++        s.prefix |= (uint32_t) bin << shift;
++        s.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
++        states[row] = s;
+     }
+ }
+ 
+-static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
+-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (row < nrows) {
+-        states[row].greater_count = 0;
+-        states[row].equal_count = 0;
+-    }
+-}
+-
+ template<int BLOCK_SIZE>
+ static __global__ void top_k_radix_gather(
+         const float * __restrict__ src,
+@@ -215,32 +218,31 @@
+     constexpr int BLOCK_SIZE = 256;
+     constexpr int RADIX_BITS = 8;
+     constexpr int NBINS = 1 << RADIX_BITS;
++    constexpr int NPASS = 32 / RADIX_BITS;
+     const int blocks_per_row = (int) std::min<int64_t>(((int64_t) ncols + 1023) / 1024, 64);
+ 
+     // chunk the rows to bound the histogram memory to 64 MB
+-    const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) blocks_per_row * NBINS * sizeof(int), nrows);
++    const int64_t chunk_nrows = ggml_cuda_chunk_nrows((size_t) NPASS * NBINS * sizeof(int), nrows);
+ 
+     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, chunk_nrows);
+-    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) chunk_nrows * blocks_per_row * NBINS);
++    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) chunk_nrows * NPASS * NBINS);
++    ggml_cuda_pool_alloc<int> done_alloc(pool, (size_t) chunk_nrows * NPASS);
+     top_k_radix_state * states = states_alloc.get();
+     int * histograms = histograms_alloc.get();
++    int * done = done_alloc.get();
+ 
+     for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+         const int iter_nrows = std::min(chunk_nrows, nrows - i);
+ 
+-        top_k_radix_init<<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows, k);
++        top_k_radix_init<NBINS, NPASS><<<iter_nrows, BLOCK_SIZE, 0, stream>>>(states, histograms, done, iter_nrows, k);
+ 
+         const dim3 row_grid(blocks_per_row * iter_nrows);
+-        for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
++        for (int pass = 0, shift = 32 - RADIX_BITS; shift >= 0; ++pass, shift -= RADIX_BITS) {
+             top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
+                 <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-                    src, states, histograms, ncols, blocks_per_row, shift);
+-            top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
+-                <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
++                    src, states, histograms, done, ncols, blocks_per_row, shift, pass, NPASS);
+         }
+ 
+-        top_k_radix_reset_counters
+-            <<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows);
+         top_k_radix_gather<BLOCK_SIZE>
+             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                 src, dst, states, ncols, k, blocks_per_row);
