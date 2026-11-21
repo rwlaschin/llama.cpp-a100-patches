@@ -1,0 +1,14 @@
+--- a/ggml/src/ggml-cuda/mmq.cuh	2026-11-06 13:39:53
++++ b/ggml/src/ggml-cuda/mmq.cuh	2026-11-06 13:39:53
+@@ -1526,7 +1526,10 @@
+     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+ 
+     const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
+-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
++    // GGML_CUDA_MMQ_SK_EFF: tiling efficiency (%) at or above which the stream-k kernel runs one block per tile and needs no fixup.
++    // Read on the host, so under CUDA graphs it is fixed at capture and costs nothing per step.
++    static const int sk_eff = [] { const char * e = getenv("GGML_CUDA_MMQ_SK_EFF"); return e ? atoi(e) : 90; }();
++    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= sk_eff ? ntiles_dst : std::min(nsm, nwork), 1, 1);
+ 
+     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+ 
