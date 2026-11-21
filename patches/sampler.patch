@@ -1,0 +1,56 @@
+--- a/src/llama-context.cpp	2026-11-06 11:02:36
++++ b/src/llama-context.cpp	2026-11-06 11:02:36
+@@ -1559,6 +1559,17 @@
+ }
+ 
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
++    // a sampler change only changes the sampling graph: drop the cached graphs (they hold the old sampler)
++    // instead of a full sched reserve, and let ggml_backend_sched grow its buffers on demand
++    const auto drop_graphs = [this] {
++        for (auto & res : gf_res_prev) {
++            if (res) {
++                res->reset();
++            }
++        }
++        gf_res_prev_active = nullptr;
++    };
++
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+     }
+@@ -1572,7 +1583,7 @@
+             warned = true;
+         }
+         if (sampling.samplers.count(seq_id) > 0) {
+-            sched_need_reserve = true;
++            drop_graphs();
+         }
+         sampling.samplers.erase(seq_id);
+         return false;
+@@ -1591,7 +1602,7 @@
+ 
+         sampling.samplers[seq_id] = sampler;
+ 
+-        sched_need_reserve = true;
++        drop_graphs();
+ 
+         return true;
+     }
+@@ -1600,7 +1611,7 @@
+         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
+ 
+         if (sampling.samplers.count(seq_id) > 0) {
+-            sched_need_reserve = true;
++            drop_graphs();
+         }
+ 
+         sampling.samplers.erase(seq_id);
+@@ -1610,7 +1621,7 @@
+ 
+     sampling.samplers.erase(seq_id);
+ 
+-    sched_need_reserve = true;
++    drop_graphs();
+ 
+     return true;
+ }
