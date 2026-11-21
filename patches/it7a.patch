@@ -1,0 +1,17 @@
+--- a/ggml/src/ggml-cuda/mmq.cu	2026-11-08 12:13:05
++++ b/ggml/src/ggml-cuda/mmq.cu	2026-11-08 12:13:05
+@@ -492,7 +492,14 @@
+     }
+ 
+     if (turing_mma_available(cc)) {
++#ifdef GGML_CUDA_MMQ_CUBLAS_ABOVE
++        // GGML_CUDA_MMQ_CUBLAS_ABOVE=N: on GA100 (A100) batches of N or more columns (prompt reading) go to the fp16
++        // tensor-core cuBLAS path, measured +59..102% prompt t/s there; smaller batches (decode) stay on MMQ. Ada (L4) is
++        // faster in int8 and measured -40% on the same path, so every other arch keeps MMQ for all batch sizes.
++        return cc != GGML_CUDA_CC_AMPERE || ne11 < GGML_CUDA_MMQ_CUBLAS_ABOVE;
++#else
+         return true;
++#endif // GGML_CUDA_MMQ_CUBLAS_ABOVE
+     }
+ 
+     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
